@@ -1,0 +1,80 @@
+name: fileguard
+
+services:
+  # Antivirus engine. First start downloads the signature database (a few minutes).
+  clamav:
+    image: clamav/clamav:stable
+    volumes:
+      - clamdb:/var/lib/clamav
+    healthcheck:
+      test: ["CMD", "clamdcheck.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 180s
+
+  # Local stand-in for S3, SQS, DynamoDB and SNS.
+  # Pinned to a version that runs without an account token.
+  localstack:
+    image: localstack/localstack:3.8.1
+    ports:
+      - "4566:4566"
+    environment:
+      SERVICES: s3,sqs,dynamodb,sns
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # One-shot job that creates the buckets, queues, table and topic.
+  init:
+    image: amazon/aws-cli:latest
+    entrypoint: ["/bin/sh", "/init.sh"]
+    volumes:
+      - ./infra/localstack/init.sh:/init.sh:ro
+    environment:
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+    depends_on:
+      localstack:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    build: ./api
+    ports:
+      - "8000:8000"
+    environment: &aws-env
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ENDPOINT_URL: http://localstack:4566
+      QUARANTINE_BUCKET: fileguard-quarantine
+      CLEAN_BUCKET: fileguard-clean
+      SCANS_TABLE: fileguard-scans
+      MAX_FILE_MB: "25"
+      # Address the browser uses to reach S3 (presigned upload URLs point here).
+      PUBLIC_S3_ENDPOINT: http://localhost:4566
+    depends_on:
+      init:
+        condition: service_completed_successfully
+
+  worker:
+    build: ./worker
+    environment:
+      <<: *aws-env
+      SCAN_QUEUE: fileguard-scan-queue
+      ALERT_TOPIC: fileguard-alerts
+      CLAMD_HOST: clamav
+      CLAMD_PORT: "3310"
+      MAX_RECEIVES: "3"
+    depends_on:
+      init:
+        condition: service_completed_successfully
+      clamav:
+        condition: service_healthy
+
+volumes:
+  clamdb:
